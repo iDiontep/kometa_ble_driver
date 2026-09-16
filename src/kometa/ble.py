@@ -11,7 +11,7 @@ from bleak import BleakClient, BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
-from bleak.exc import BleakError
+from bleak.exc import BleakCharacteristicNotFoundError, BleakError
 
 from kometa.constants import (
     DEFAULT_COMMAND_TIMEOUT_S,
@@ -21,13 +21,33 @@ from kometa.constants import (
     DEVICE_NAME_PREFIX,
     MAX_CHAR_VALUE_LEN,
     RX_CHAR_UUID,
-    SERVICE_UUID,
     TX_CHAR_UUID,
 )
 from kometa.exceptions import KometaDisconnected, KometaNotFound, KometaTimeout
+from kometa.profiles import Generation, display_name, generation_from_advertisement, profile_for
 from kometa.protocol import looks_complete
 
 logger = logging.getLogger(__name__)
+
+_GAP = "00001800-0000-1000-8000-00805f9b34fb"
+_GATT = "00001801-0000-1000-8000-00805f9b34fb"
+_NORDIC_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+_NORDIC_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+_GATT_SETTLE_S = 2.0
+
+
+def _reverse_uuid(uuid: str) -> str:
+    """NimBLE BLE_UUID128_INIT is little-endian; some tables store the string order."""
+    raw = uuid.replace("-", "")
+    rev = bytes.fromhex(raw)[::-1].hex()
+    return f"{rev[0:8]}-{rev[8:12]}-{rev[12:16]}-{rev[16:20]}-{rev[20:32]}"
+
+
+_KNOWN_UART_PAIRS = (
+    (RX_CHAR_UUID, TX_CHAR_UUID),
+    (_reverse_uuid(RX_CHAR_UUID), _reverse_uuid(TX_CHAR_UUID)),
+    (_NORDIC_RX, _NORDIC_TX),
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +55,7 @@ class FoundDevice:
     name: str
     address: str
     rssi: int | None
+    generation: Generation = Generation.UNKNOWN
 
 
 def _is_kometa(device: BLEDevice, adv: AdvertisementData) -> bool:
@@ -56,7 +77,13 @@ async def scan(
         rssi = adv.rssi if adv.rssi is not None else getattr(device, "rssi", None)
         previous = found.get(device.address)
         if previous is None or (rssi is not None and (previous.rssi is None or rssi > previous.rssi)):
-            found[device.address] = FoundDevice(name=name, address=device.address, rssi=rssi)
+            generation = generation_from_advertisement(name, device.address)
+            found[device.address] = FoundDevice(
+                name=display_name(generation, name),
+                address=device.address,
+                rssi=rssi,
+                generation=generation,
+            )
 
     # ADV payload on WB is name-only, so do not filter by service UUID.
     scanner = BleakScanner(_callback, adapter=adapter)
@@ -90,7 +117,7 @@ async def find_device(
         if wanted_addr:
             found.set_result(device)
             return
-        if wanted_name == DEVICE_NAME.upper():
+        if wanted_name in {DEVICE_NAME.upper(), DEVICE_NAME_PREFIX}:
             if advertised.startswith(DEVICE_NAME_PREFIX):
                 found.set_result(device)
             return
@@ -128,11 +155,16 @@ class KometaBle:
         self.idle = idle
         self.write_with_response = write_with_response
         self.client: BleakClient | None = None
+        self.generation = Generation.UNKNOWN
+        self.advertised_name = name
         self._rx = bytearray()
         self._chunk = asyncio.Event()
         self._lock = asyncio.Lock()
         self._disconnected = asyncio.Event()
         self._on_unsolicited: Callable[[str], None] | None = None
+        self._rx_uuid = RX_CHAR_UUID
+        self._tx_uuid = TX_CHAR_UUID
+        self._ble_device: BLEDevice | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -152,17 +184,151 @@ class KometaBle:
             adapter=self.adapter,
         )
         self.address = device.address
-        client_kwargs: dict[str, object] = {
-            "disconnected_callback": self._on_disconnect,
-            "services": [SERVICE_UUID],
-        }
-        self.client = BleakClient(device, **client_kwargs)
+        cached_name = (device.name or self.name or "").strip()
+        self.generation = generation_from_advertisement(cached_name, self.address)
+        profile = profile_for(self.generation)
+        self.advertised_name = display_name(self.generation, cached_name)
+        self.timeout = max(self.timeout, profile.command_timeout_s)
+        self.idle = max(self.idle, profile.idle_s)
+        self.write_with_response = profile.write_with_response
+        logger.info(
+            "Using %s profile for %s (%s)",
+            profile.generation.value,
+            self.advertised_name or "unnamed",
+            self.address,
+        )
+        self._ble_device = device
         self._disconnected.clear()
-        await self.client.connect()
-        await self.client.start_notify(TX_CHAR_UUID, self._on_notify)
+        # ESP32 NimBLE emits Service Changed while Windows is still enumerating GATT.
+        # WinRT then logs "unhandled services changed" and start_notify fails.
+        self.client = self._make_client(device, use_cached_services=False)
+        await self._connect_and_subscribe()
+        rx_uuid, tx_uuid = await self._wait_for_uart_chars()
+        if rx_uuid is None or tx_uuid is None:
+            logger.warning(
+                "GATT not ready on %s after connect, reconnecting with Windows cache",
+                self.address,
+            )
+            await self._drop_client()
+            await asyncio.sleep(0.8)
+            self._disconnected.clear()
+            self.client = self._make_client(device, use_cached_services=True)
+            await self._connect_and_subscribe()
+            rx_uuid, tx_uuid = await self._wait_for_uart_chars()
+        if rx_uuid is None or tx_uuid is None:
+            raise BleakError(self._gatt_missing_message())
+        self._rx_uuid = rx_uuid
+        self._tx_uuid = tx_uuid
+        logger.info("UART chars RX=%s TX=%s", self._rx_uuid, self._tx_uuid)
+        try:
+            await self.client.start_notify(self._tx_uuid, self._on_notify)
+        except BleakCharacteristicNotFoundError as exc:
+            raise BleakError(self._gatt_missing_message()) from exc
+        await asyncio.sleep(0.25)
         await self._drain_welcome()
-        logger.info("Connected to %s (%s)", device.name or self.name, device.address)
+        self._disconnected.clear()
+        logger.info("Connected to %s (%s)", self.advertised_name or self.name, device.address)
         return device
+
+    def _make_client(self, device: BLEDevice, use_cached_services: bool) -> BleakClient:
+        client = BleakClient(
+            device,
+            disconnected_callback=self._on_disconnect,
+            timeout=30.0,
+            winrt={"use_cached_services": use_cached_services},
+        )
+        backend = getattr(client, "_backend", None)
+        if backend is not None and hasattr(backend, "_retry_on_services_changed"):
+            backend._retry_on_services_changed = True
+        return client
+
+    async def _connect_and_subscribe(self) -> None:
+        assert self.client is not None
+        await self.client.connect()
+
+    async def _drop_client(self) -> None:
+        client = self.client
+        self.client = None
+        if client is None:
+            return
+        try:
+            if client.is_connected:
+                await client.disconnect()
+        except BleakError:
+            pass
+
+    async def _wait_for_uart_chars(self) -> tuple[str | None, str | None]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _GATT_SETTLE_S
+        last: tuple[str | None, str | None] = (None, None)
+        while True:
+            last = self._resolve_uart_chars()
+            if last[0] and last[1]:
+                return last
+            if loop.time() >= deadline:
+                return last
+            await asyncio.sleep(0.25)
+
+    def _resolve_uart_chars(self) -> tuple[str | None, str | None]:
+        if self.client is None:
+            return None, None
+        try:
+            services = self.client.services
+        except BleakError:
+            return None, None
+        if services is None:
+            return None, None
+
+        def _get(uuid: str) -> BleakGATTCharacteristic | None:
+            try:
+                return services.get_characteristic(uuid)
+            except Exception:
+                return None
+
+        for rx_uuid, tx_uuid in _KNOWN_UART_PAIRS:
+            if _get(rx_uuid) is not None and _get(tx_uuid) is not None:
+                return rx_uuid, tx_uuid
+
+        for service in services:
+            if service.uuid.lower() in {_GAP, _GATT}:
+                continue
+            rx_char = None
+            tx_char = None
+            for char in service.characteristics:
+                props = {item.lower() for item in char.properties}
+                if tx_char is None and "notify" in props:
+                    tx_char = char
+                if rx_char is None and ("write" in props or "write-without-response" in props):
+                    rx_char = char
+            if rx_char is not None and tx_char is not None:
+                logger.info(
+                    "Resolved UART pair on %s: RX %s TX %s",
+                    service.uuid,
+                    rx_char.uuid,
+                    tx_char.uuid,
+                )
+                return rx_char.uuid, tx_char.uuid
+        return None, None
+
+    def _gatt_missing_message(self) -> str:
+        lines = [
+            f"TX/RX characteristics not found on {self.address}.",
+            "ESP32 ble-module often finishes GATT after Service Changed; retry Connect.",
+            "Discovered services:",
+        ]
+        try:
+            services = self.client.services if self.client is not None else None
+            listed = list(services) if services is not None else []
+            if not listed:
+                lines.append("  (none — Windows GATT cache is empty)")
+            else:
+                for service in listed:
+                    lines.append(f"  service {service.uuid}")
+                    for char in service.characteristics:
+                        lines.append(f"    {char.uuid}  {char.properties}")
+        except Exception as exc:
+            lines.append(f"  (could not list GATT: {exc})")
+        return "\n".join(lines)
 
     async def disconnect(self) -> None:
         client = self.client
@@ -171,7 +337,7 @@ class KometaBle:
             return
         try:
             if client.is_connected:
-                await client.stop_notify(TX_CHAR_UUID)
+                await client.stop_notify(self._tx_uuid)
                 await client.disconnect()
         except BleakError as exc:
             logger.debug("Disconnect ignored: %s", exc)
@@ -188,7 +354,20 @@ class KometaBle:
             self._rx.clear()
             self._chunk.clear()
             await self._write_chunks(payload)
-            return await self._read_response()
+            try:
+                return await self._read_response()
+            except KometaTimeout as exc:
+                if self.generation is Generation.D1 and not (exc.partial or "").strip():
+                    logger.warning(
+                        "d1 got no HGFE notify, retrying write response=%s",
+                        not self.write_with_response,
+                    )
+                    self.write_with_response = not self.write_with_response
+                    self._rx.clear()
+                    self._chunk.clear()
+                    await self._write_chunks(payload)
+                    return await self._read_response()
+                raise
 
     async def _write_chunks(self, payload: bytes) -> None:
         assert self.client is not None
@@ -197,13 +376,22 @@ class KometaBle:
             chunk = payload[offset : offset + MAX_CHAR_VALUE_LEN]
             try:
                 await self.client.write_gatt_char(
-                    RX_CHAR_UUID,
+                    self._rx_uuid,
                     chunk,
                     response=self.write_with_response,
                 )
-            except BleakError:
-                # Some Windows stacks reject Write Request on this characteristic.
-                await self.client.write_gatt_char(RX_CHAR_UUID, chunk, response=False)
+            except BleakError as exc:
+                logger.warning(
+                    "GATT write response=%s failed: %s; trying opposite",
+                    self.write_with_response,
+                    exc,
+                )
+                await self.client.write_gatt_char(
+                    self._rx_uuid,
+                    chunk,
+                    response=not self.write_with_response,
+                )
+                self.write_with_response = not self.write_with_response
             offset += len(chunk)
 
     async def _read_response(self) -> str:
@@ -225,7 +413,8 @@ class KometaBle:
                 continue
             except asyncio.TimeoutError:
                 text = self._decode()
-                if looks_complete(text):
+                require_tail = self.generation is not Generation.D1
+                if looks_complete(text, require_tail=require_tail):
                     self._rx.clear()
                     return text
                 if loop.time() >= deadline:

@@ -1,4 +1,4 @@
-"""High-level KOMETA v2 client: GET/SET APS, GET APD, raw CLI passthrough."""
+"""High-level KOMETA client: d1 (ble-module) and d2 (STM32WB)."""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ from kometa.constants import (
     Command,
     DEVICE_NAME,
     RUNTIME_GET_ONLY,
-    feature_for,
 )
 from kometa.exceptions import KometaNotAvailable
+from kometa.profiles import Generation, feature_for, profile_for
 from kometa.protocol import (
     KometaResponse,
     build_get,
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class KometaClient:
-    """Talk to a KOMETA v2 over the CellerLab Bluetooth 5.3 adapter."""
+    """Talk to KOMETA d1 or d2 over the CellerLab Bluetooth 5.3 adapter."""
 
     def __init__(
         self,
@@ -45,6 +45,14 @@ class KometaClient:
         return self.transport.address
 
     @property
+    def advertised_name(self) -> str:
+        return self.transport.advertised_name
+
+    @property
+    def generation(self) -> Generation:
+        return self.transport.generation
+
+    @property
     def is_connected(self) -> bool:
         return self.transport.is_connected
 
@@ -56,7 +64,13 @@ class KometaClient:
 
     async def command(self, text: str) -> KometaResponse:
         frame = normalize_command(text)
-        raw = await self.transport.write_command(frame)
+        previous_timeout = self.transport.timeout
+        if _is_help(frame):
+            self.transport.timeout = max(previous_timeout, profile_for(self.generation).help_timeout_s)
+        try:
+            raw = await self.transport.write_command(frame)
+        finally:
+            self.transport.timeout = previous_timeout
         response = parse_response(raw)
         if self.raise_on_error:
             response.raise_for_status()
@@ -64,7 +78,7 @@ class KometaClient:
 
     async def get(self, category: str | Category, *params: str) -> dict[str, int]:
         cat = _category(category)
-        _warn_if_missing(Command.GET.value, cat.value)
+        _warn_if_missing(Command.GET.value, cat.value, self.generation)
         response = await self.command(build_get(cat.value, *params))
         return response.fields
 
@@ -79,11 +93,10 @@ class KometaClient:
         cat = _category(category)
         if cat in RUNTIME_GET_ONLY:
             raise KometaNotAvailable(f"{cat.value} is read-only")
-        _warn_if_missing(Command.SET.value, cat.value)
+        _warn_if_missing(Command.SET.value, cat.value, self.generation)
         merged = dict(values or {})
         merged.update(kwargs)
-        response = await self.command(build_set(cat.value, merged, default=default))
-        return response
+        return await self.command(build_set(cat.value, merged, default=default))
 
     async def get_aps(self, *params: str) -> dict[str, int]:
         if params:
@@ -109,16 +122,24 @@ class KometaClient:
         return await self.get(Category.APD, "ALL")
 
     async def get_hws(self, *params: str) -> dict[str, int]:
-        return await self.get(Category.HWS, *params)
+        return await self.get(Category.HWS, *(params or ("ALL",)))
+
+    async def set_hws(self, values: Mapping[str, int] | None = None, **kwargs: int) -> dict[str, int]:
+        response = await self.set(Category.HWS, values, **kwargs)
+        return response.fields
 
     async def get_sas(self, *params: str) -> dict[str, int]:
-        return await self.get(Category.SAS, *params)
+        return await self.get(Category.SAS, *(params or ("ALL",)))
+
+    async def set_sas(self, values: Mapping[str, int] | None = None, **kwargs: int) -> dict[str, int]:
+        response = await self.set(Category.SAS, values, **kwargs)
+        return response.fields
 
     async def get_hwd(self, *params: str) -> dict[str, int]:
-        return await self.get(Category.HWD, *params)
+        return await self.get(Category.HWD, *(params or ("ALL",)))
 
     async def get_sad(self, *params: str) -> dict[str, int]:
-        return await self.get(Category.SAD, *params)
+        return await self.get(Category.SAD, *(params or ("ALL",)))
 
     async def fwv(self) -> KometaResponse:
         return await self._special(Command.FWV)
@@ -132,7 +153,7 @@ class KometaClient:
     async def service(self, *stages: str) -> KometaResponse:
         extra = " ".join(stages)
         text = f"SERVICE {extra}".strip()
-        _warn_if_missing(Command.SERVICE.value, None)
+        _warn_if_missing(Command.SERVICE.value, None, self.generation)
         return await self.command(text)
 
     async def ship(self) -> KometaResponse:
@@ -145,7 +166,7 @@ class KometaClient:
         return await self._special(Command.FACTORY)
 
     async def _special(self, cmd: Command) -> KometaResponse:
-        _warn_if_missing(cmd.value, None)
+        _warn_if_missing(cmd.value, None, self.generation)
         return await self.command(cmd.value)
 
     async def __aenter__(self) -> KometaClient:
@@ -165,14 +186,17 @@ def _category(value: str | Category) -> Category:
         raise ValueError(f"unknown category {value!r}") from exc
 
 
-def _warn_if_missing(cmd: str, category: str | None) -> None:
-    feature = feature_for(cmd, category)
+def _is_help(frame: str) -> bool:
+    body = frame.upper().replace("EFGH", "", 1).strip()
+    return body.startswith("HELP")
+
+
+def _warn_if_missing(cmd: str, category: str | None, generation: Generation) -> None:
+    feature = feature_for(cmd, category, generation)
     if feature is not None and not feature.implemented:
-        note = describe_capability(cmd, category)
-        # The command is still sent; firmware currently answers Invalid Command / Category not available.
-        logger_note = note or "not implemented on this firmware"
+        note = describe_capability(cmd, category, generation)
         logger.info(
             "Sending %s anyway (%s)",
             cmd if not category else f"{cmd} {category}",
-            logger_note,
+            note or "not implemented on this firmware",
         )

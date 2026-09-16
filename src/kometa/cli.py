@@ -9,7 +9,6 @@ import sys
 
 from kometa.ble import scan
 from kometa.client import KometaClient
-from kometa.constants import DEVICE_NAME
 from kometa.exceptions import KometaError
 from kometa.protocol import KometaResponse
 
@@ -38,10 +37,10 @@ def main(argv: list[str] | None = None) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kometa",
-        description="BLE host driver for CellerLab KOMETA v2 (Bluetooth 5.3 adapter)",
+        description="BLE host driver for CellerLab KOMETA d1 (ble-module) and d2 (STM32WB)",
     )
     parser.add_argument("--address", help="BLE address, skip scan if given")
-    parser.add_argument("--name", default=DEVICE_NAME, help=f"Advertised name (default: {DEVICE_NAME})")
+    parser.add_argument("--name", default="KOMETA", help="Advertised name or prefix (default: any KOMETA)")
     parser.add_argument("--adapter", help="Bluetooth adapter id (Windows radio / Linux hciX)")
     parser.add_argument("--timeout", type=float, default=3.0, help="Command timeout in seconds")
     parser.add_argument("--scan-timeout", type=float, default=8.0, help="Scan timeout in seconds")
@@ -55,6 +54,10 @@ def _build_parser() -> argparse.ArgumentParser:
     set_aps.add_argument("assignments", nargs="+", help="VOL=2 TX_DEBUG=1")
     sub.add_parser("set-aps-dflt", help="SET APS DFLT (RAM only on WB)")
     sub.add_parser("get-apd", help="GET APD ALL or listed tags").add_argument("tags", nargs="*")
+    sub.add_parser("get-hws", help="GET HWS ALL (d1)").add_argument("tags", nargs="*")
+    sub.add_parser("get-sas", help="GET SAS ALL (d1)").add_argument("tags", nargs="*")
+    sub.add_parser("get-hwd", help="GET HWD ALL (d1)").add_argument("tags", nargs="*")
+    sub.add_parser("get-sad", help="GET SAD ALL (d1)").add_argument("tags", nargs="*")
 
     cmd = sub.add_parser("cmd", help="Send a raw CLI frame (EFGH is optional)")
     cmd.add_argument("text", nargs="+", help='Example: GET APS VOL')
@@ -71,7 +74,7 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return 1
         for device in devices:
             rssi = f"{device.rssi} dBm" if device.rssi is not None else "n/a"
-            print(f"{device.address}  {device.name}  rssi={rssi}")
+            print(f"{device.address}  {device.name}  [{device.generation.value}]  rssi={rssi}")
         return 0
 
     async with KometaClient(
@@ -92,6 +95,18 @@ async def _dispatch(args: argparse.Namespace) -> int:
         elif args.action == "get-apd":
             tags = tuple(tag.upper() for tag in args.tags) or ("ALL",)
             _print_response(await client.command(f"GET APD {' '.join(tags)}"))
+        elif args.action == "get-hws":
+            tags = tuple(tag.upper() for tag in args.tags) or ("ALL",)
+            _print_response(await client.command(f"GET HWS {' '.join(tags)}"))
+        elif args.action == "get-sas":
+            tags = tuple(tag.upper() for tag in args.tags) or ("ALL",)
+            _print_response(await client.command(f"GET SAS {' '.join(tags)}"))
+        elif args.action == "get-hwd":
+            tags = tuple(tag.upper() for tag in args.tags) or ("ALL",)
+            _print_response(await client.command(f"GET HWD {' '.join(tags)}"))
+        elif args.action == "get-sad":
+            tags = tuple(tag.upper() for tag in args.tags) or ("ALL",)
+            _print_response(await client.command(f"GET SAD {' '.join(tags)}"))
         elif args.action == "cmd":
             _print_response(await client.command(" ".join(args.text)))
         elif args.action == "shell":
@@ -113,8 +128,11 @@ def _print_response(response: KometaResponse) -> None:
 
 
 async def _shell(client: KometaClient) -> None:
-    print(f"Connected to {client.address}. Type EFGH commands, or GET/SET without the prefix.")
-    print("Examples: GET APS ALL   |   SET APS VOL=2   |   GET APD TICKS   |   quit")
+    print(
+        f"Connected to {client.advertised_name or client.address} [{client.generation.value}]. "
+        "Type EFGH commands, or GET/SET without the prefix."
+    )
+    print("Examples: GET APS ALL   |   GET HWS ALL   |   SET APS VOL=2   |   HELP   |   quit")
     while True:
         try:
             line = await asyncio.to_thread(input, "kometa> ")

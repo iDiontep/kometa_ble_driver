@@ -65,6 +65,20 @@ def test_looks_complete() -> None:
     assert not looks_complete("HG")
     assert looks_complete("HGFE VOL 2 \r\n")
     assert looks_complete("xxHGFE BLE ON\r\n")
+    assert looks_complete("HGFE VOL 2") is False
+    assert looks_complete("HGFE VOL 2", require_tail=False)
+
+
+def test_parse_help_is_ok() -> None:
+    raw = (
+        "HGFE Use BIG or small letters.\r\n"
+        "Format: <CMD> <CATEGORY> <PARAMS>\r\n"
+        "Error Recovery:\r\n"
+        "  If you see EEPROM READ ERROR\r\n"
+    )
+    response = parse_response(raw)
+    assert response.ok
+    assert not response.not_available
 
 
 def test_parse_skips_welcome_frame() -> None:

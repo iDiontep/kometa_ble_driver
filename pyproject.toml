@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kometa"
 version = "0.1.0"
-description = "Python BLE host driver for CellerLab KOMETA v2"
+description = "Python BLE host driver for CellerLab KOMETA d1 and d2"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "CellerLab" }]

@@ -1,28 +1,34 @@
-# KOMETA v2 BLE driver
+# KOMETA BLE driver (d1 + d2)
 
-Python host for **KOMETA V2.0**. It uses the system Bluetooth adapter (CellerLab USB 5.3) and talks to the custom GATT service on the STM32WB.
+Python host for **KOMETA V1.0** (d1 + ESP32 `ble-module`) and **KOMETA V2.0** (d2 STM32WB).
+Uses the CellerLab Bluetooth 5.3 adapter. Commands go to RX as `EFGH …`, replies come as TX notify `HGFE …`.
 
-Commands go to RX as `EFGH …`. Replies come back as TX notifications starting with `HGFE`.
+## Devices
 
-## Firmware map (current WB build)
+| Advertisement | Hardware | Path |
+|---|---|---|
+| `KOMETA V1.0` | d1 STM32L0 + ESP32 | GATT write → UART → `uart_ble.c` |
+| `KOMETA V2.0` | d2 STM32WB | onboard GATT, `cli.c` |
 
-| Command | Status |
-|---|---|
-| `EFGH GET APS ALL` / `VOL` / … | works, RAM settings |
-| `EFGH SET APS VOL=2` | works, **RAM only** |
-| `EFGH SET APS DFLT` | works, RAM only |
-| `EFGH GET APD ALL` | works, read-only |
-| `HWS` / `SAS` / `HWD` / `SAD` | firmware: `Category not available` |
-| EEPROM write after SET | not on WB yet |
-| `SERVICE`, `FWV`, `HELP`, `SHIP`, … | firmware: `Invalid Command` |
-
-Raw passthrough still sends those frames, so the same driver keeps working when the firmware grows.
-
-GATT (same UUIDs as `ble-module`):
+Same GATT UUIDs (`ble-module` / `kometa_ble_gatt.c`):
 
 - service `3ba1eb58-dd27-8bbc-6c45-7c678cfca153`
 - RX write `e1f75570-6196-46df-806c-5c6661445c5e`
 - TX notify `38761769-7097-424b-967e-e718a8834f60`
+
+d1 RX is **Write Request** only; the driver enables that automatically.
+
+## Firmware map
+
+| Command | d1 (`KOMETA V1.0`) | d2 (`KOMETA V2.0`) |
+|---|---|---|
+| `GET/SET APS` | RAM + EEPROM | RAM only |
+| `GET APD` | yes | yes |
+| `GET/SET HWS SAS` | RAM + EEPROM | `Category not available` |
+| `GET HWD SAD` | yes | `Category not available` |
+| `FWV HELP SERVICE SHIP RST FACTORY CHG` | yes | `Invalid Command` |
+
+Scan lists both names. The client picks the profile from the advertisement.
 
 ## Install
 
@@ -56,7 +62,9 @@ python -m kometa get-aps
 python -m kometa get-aps VOL
 python -m kometa set-aps VOL=2
 python -m kometa set-aps-dflt
-python -m kometa get-apd
+python -m kometa get-hws
+python -m kometa get-hwd
+python -m kometa cmd "HELP"
 python -m kometa cmd "GET APS ALL"
 python -m kometa shell
 ```

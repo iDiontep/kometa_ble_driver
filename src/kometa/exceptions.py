@@ -15,7 +15,11 @@ class KometaTimeout(KometaError):
     """Timed out waiting for a BLE notification or scan result."""
 
     def __init__(self, message: str, partial: str = "") -> None:
-        super().__init__(message)
+        extra = ""
+        if partial:
+            preview = partial.replace("\r", "\\r").replace("\n", "\\n")
+            extra = f" [{preview}]"
+        super().__init__(message + extra)
         self.partial = partial
 
 

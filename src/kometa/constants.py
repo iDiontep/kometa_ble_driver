@@ -5,6 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+
+@dataclass(frozen=True)
+class Feature:
+    implemented: bool
+    notes: str
+
 DEVICE_NAME = "KOMETA V2.0"
 DEVICE_NAME_PREFIX = "KOMETA"
 
@@ -88,43 +94,3 @@ APD_TAGS = (
 
 RUNTIME_GET_ONLY = {Category.APD, Category.HWD, Category.SAD}
 SETTINGS_CATEGORIES = {Category.APS, Category.HWS, Category.SAS}
-
-
-@dataclass(frozen=True)
-class Feature:
-    implemented: bool
-    notes: str
-
-
-# Matches Logic/Src/cli.c on the current WB firmware.
-FEATURES: dict[tuple[str, str | None], Feature] = {
-    ("GET", "APS"): Feature(True, "Application settings in RAM"),
-    ("SET", "APS"): Feature(True, "Changes RAM only — EEPROM write is not implemented on WB"),
-    ("GET", "APD"): Feature(True, "Runtime data, read-only"),
-    ("SET", "APD"): Feature(False, "Firmware answers read-only"),
-    ("GET", "HWS"): Feature(False, "Category not available"),
-    ("SET", "HWS"): Feature(False, "Category not available"),
-    ("GET", "SAS"): Feature(False, "Category not available"),
-    ("SET", "SAS"): Feature(False, "Category not available"),
-    ("GET", "HWD"): Feature(False, "Category not available"),
-    ("SET", "HWD"): Feature(False, "Category not available"),
-    ("GET", "SAD"): Feature(False, "Category not available"),
-    ("SET", "SAD"): Feature(False, "Category not available"),
-    ("FWV", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("HELP", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("CHG", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("SERVICE", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("RST", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("SHIP", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("DATA", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("FACTORY", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("USB_DFU", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("USB_CDC", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("SLEEP", None): Feature(False, "Special command is not in the v2 CLI yet"),
-    ("STOP", None): Feature(False, "Special command is not in the v2 CLI yet"),
-}
-
-
-def feature_for(cmd: str, category: str | None = None) -> Feature | None:
-    key = (cmd.upper(), category.upper() if category else None)
-    return FEATURES.get(key)

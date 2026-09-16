@@ -1,4 +1,4 @@
-"""Python BLE host driver for CellerLab KOMETA v2."""
+"""Python BLE host driver for CellerLab KOMETA d1 and d2."""
 
 from kometa.ble import FoundDevice, KometaBle, find_device, scan
 from kometa.client import KometaClient
@@ -20,6 +20,14 @@ from kometa.exceptions import (
     KometaNotFound,
     KometaTimeout,
 )
+from kometa.profiles import (
+    DEVICE_NAME_D1,
+    DEVICE_NAME_D2,
+    Generation,
+    generation_from_advertisement,
+    generation_from_name,
+    profile_for,
+)
 from kometa.protocol import KometaResponse, build_get, build_set, normalize_command, parse_response
 
 __all__ = [
@@ -28,7 +36,10 @@ __all__ = [
     "Category",
     "Command",
     "DEVICE_NAME",
+    "DEVICE_NAME_D1",
+    "DEVICE_NAME_D2",
     "FoundDevice",
+    "Generation",
     "KometaBle",
     "KometaClient",
     "KometaCommandError",
@@ -44,7 +55,10 @@ __all__ = [
     "build_get",
     "build_set",
     "find_device",
+    "generation_from_advertisement",
+    "generation_from_name",
     "normalize_command",
     "parse_response",
+    "profile_for",
     "scan",
 ]

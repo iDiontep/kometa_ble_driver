@@ -45,14 +45,13 @@ HELP_TEXT = (
     "KOMETA BLE Terminal\n\n"
     "Format: EFGH <CMD> [CATEGORY] [PARAMS]\n"
     "Dividers: space, comma, =\n\n"
-    "Works on current WB firmware:\n"
-    "  GET APS ALL / VOL / ...\n"
-    "  SET APS VOL=2\n"
-    "  SET APS DFLT     (RAM only, no EEPROM yet)\n"
-    "  GET APD ALL      (read-only)\n\n"
-    "Not on WB yet:\n"
-    "  HWS / SAS / HWD / SAD  -> Category not available\n"
-    "  FWV, HELP, SERVICE, SHIP, RST, FACTORY, CHG\n"
+    "Scan finds both:\n"
+    "  KOMETA V1.0  — d1 through ESP32 ble-module\n"
+    "  KOMETA V2.0  — d2 STM32WB onboard BLE\n\n"
+    "d1: GET/SET APS HWS SAS, GET APD HWD SAD,\n"
+    "    FWV HELP SERVICE SHIP RST FACTORY CHG (EEPROM on SET).\n"
+    "d2: GET/SET APS (RAM only), GET APD.\n"
+    "    HWS/SAS/HWD/SAD and specials are not on WB yet.\n"
 )
 
 
@@ -102,11 +101,17 @@ class BleWorker:
         await self._disconnect()
         self.events.put(("status", "Connecting..."))
         client = KometaClient(address=address, raise_on_error=False)
+        client.transport.set_unsolicited_handler(lambda text: self.events.put(("rx", text)))
         await client.connect()
         self.client = client
-        self.events.put(("connected", client.address or address or ""))
-        self.events.put(("rx", "HGFE BLE connected\r\n"))
-        self.events.put(("status", f"Connected {client.address}"))
+        info = {
+            "address": client.address or address or "",
+            "name": client.advertised_name,
+            "generation": client.generation.value,
+        }
+        self.events.put(("connected", info))
+        self.events.put(("rx", f"HGFE BLE connected {info['name'] or info['address']} ({info['generation']})\r\n"))
+        self.events.put(("status", f"Connected {info['name'] or info['address']} [{info['generation']}]"))
 
     def disconnect(self) -> None:
         self.submit(self._disconnect())
@@ -188,7 +193,7 @@ class KometaTerminal(tk.Tk):
         self.device_combo.pack(fill=tk.X, pady=4)
         hint = tk.Label(
             mid,
-            text="Bluetooth 5.3 adapter  |  scan finds advertising KOMETA V2.0",
+            text="Bluetooth 5.3  |  V1.0 = d1 ble-module,  V2.0 = d2 WB",
             font=FONT_UI,
             bg=BG,
             fg="#404040",
@@ -201,7 +206,7 @@ class KometaTerminal(tk.Tk):
         self.led.grid(row=0, column=0, padx=4)
         self._led_item = self.led.create_oval(3, 3, 15, 15, fill=LED_OFF, outline="#404040")
         tk.Label(leds, text="CONN", font=FONT_UI, bg=BG).grid(row=0, column=1)
-        self.lbl_addr = tk.Label(leds, text="---", font=FONT_UI, bg=BG, width=22, anchor=tk.W)
+        self.lbl_addr = tk.Label(leds, text="---", font=FONT_UI, bg=BG, width=36, anchor=tk.W)
         self.lbl_addr.grid(row=1, column=0, columnspan=2, pady=(4, 0))
 
         self.receive = self._make_pane(self, "Receive", height=18, extra=self._receive_toolbar)
@@ -395,11 +400,15 @@ class KometaTerminal(tk.Tk):
         self.btn_connect.configure(state=state)
         self.btn_rescan.configure(state=state)
 
-    def _set_connected(self, connected: bool, address: str = "") -> None:
+    def _set_connected(self, connected: bool, address: str = "", extra: dict | None = None) -> None:
         self.connected = connected
         self.led.itemconfigure(self._led_item, fill=LED_ON if connected else LED_OFF)
         self.btn_connect.configure(text="Disconnect" if connected else "Connect")
-        self.lbl_addr.configure(text=address or "---")
+        if extra and extra.get("name"):
+            label = f"{extra.get('name')}  [{extra.get('generation', '?')}]  {address}"
+        else:
+            label = address or "---"
+        self.lbl_addr.configure(text=label)
 
     def _append(self, widget: tk.Text, data: str, tag: str) -> None:
         if not self.ascii_mode.get() and tag in {"tx", "rx"}:
@@ -417,7 +426,10 @@ class KometaTerminal(tk.Tk):
                 if kind == "devices":
                     self._set_devices(payload)
                 elif kind == "connected":
-                    self._set_connected(True, str(payload))
+                    if isinstance(payload, dict):
+                        self._set_connected(True, str(payload.get("address") or ""), payload)
+                    else:
+                        self._set_connected(True, str(payload))
                 elif kind == "disconnected":
                     self._set_connected(False)
                 elif kind == "tx":
@@ -438,7 +450,8 @@ class KometaTerminal(tk.Tk):
 
 def _device_label(device: FoundDevice) -> str:
     rssi = f"  {device.rssi} dBm" if device.rssi is not None else ""
-    return f"{device.name}{rssi}  {device.address}"
+    gen = f"  [{device.generation.value}]" if device.generation.value != "unknown" else ""
+    return f"{device.name}{gen}{rssi}  {device.address}"
 
 
 def _tooltip(widget: tk.Widget, text: str) -> None:

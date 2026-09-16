@@ -9,9 +9,9 @@ from kometa.constants import (
     PACKET_TAIL,
     REQUEST_HEAD,
     RESPONSE_HEAD,
-    feature_for,
 )
 from kometa.exceptions import KometaCommandError, KometaNotAvailable
+from kometa.profiles import Generation, feature_for
 
 _FIELD_RE = re.compile(r"^([A-Z][A-Z0-9_]*)\s+(-?\d+)\s*$")
 _NOT_AVAILABLE_MARKERS = (
@@ -77,13 +77,17 @@ def build_set(category: str, values: dict[str, int] | None = None, default: bool
     return normalize_command(f"SET {category} {assignments}")
 
 
-def looks_complete(buffer: str) -> bool:
+def looks_complete(buffer: str, *, require_tail: bool = True) -> bool:
     """True when the assembled notify stream looks like a finished HGFE frame."""
     text = buffer.lstrip("\x00")
     if RESPONSE_HEAD not in text:
         return False
     start = text.find(RESPONSE_HEAD)
-    return PACKET_TAIL in text[start:]
+    rest = text[start:]
+    if PACKET_TAIL in rest or "\n" in rest:
+        return True
+    # d1 ble-module may drop the last UART fragment that carries CRLF.
+    return (not require_tail) and len(rest.strip()) > len(RESPONSE_HEAD)
 
 
 def _last_frame(raw: str) -> str:
@@ -118,11 +122,10 @@ def parse_response(raw: str) -> KometaResponse:
             leftover.append(line)
 
     message = " ".join(leftover).strip() or None
-    upper_message = (message or "").upper()
-    not_available = any(marker in upper_message for marker in _NOT_AVAILABLE_MARKERS)
-    is_error = (not fields) and message is not None and any(
-        marker in upper_message for marker in _ERROR_MARKERS
-    )
+    first_line = leftover[0].upper() if leftover else ""
+    compact = len(leftover) <= 2 and len(first_line) < 80
+    not_available = compact and any(marker in first_line for marker in _NOT_AVAILABLE_MARKERS)
+    is_error = compact and not fields and any(marker in first_line for marker in _ERROR_MARKERS)
 
     return KometaResponse(
         raw=text,
@@ -134,8 +137,12 @@ def parse_response(raw: str) -> KometaResponse:
     )
 
 
-def describe_capability(cmd: str, category: str | None = None) -> str | None:
-    feature = feature_for(cmd, category)
+def describe_capability(
+    cmd: str,
+    category: str | None = None,
+    generation: Generation = Generation.D2,
+) -> str | None:
+    feature = feature_for(cmd, category, generation)
     if feature is None:
         return None
     state = "supported" if feature.implemented else "not on this firmware"
